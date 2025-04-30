@@ -15,6 +15,7 @@ const loadConfig = () => {
       userPoolId: window.REACT_APP_CONFIG.userPoolId,
       userPoolClientId: window.REACT_APP_CONFIG.userPoolClientId,
       region: window.REACT_APP_CONFIG.region,
+      modelId: window.REACT_APP_CONFIG.modelId,
     };
   }
   
@@ -103,7 +104,7 @@ function ChatInterface({ signOut, user }) {
   return (
     <div className="App">
       <header className="App-header">
-        <h1>Bedrock LLM チャットボット</h1>
+        <h1>Bedrock LLM チャットボット | モデル: {config.modelId}</h1>
         <div className="header-buttons">
           <button className="clear-button" onClick={clearConversation}>
             会話をクリア
