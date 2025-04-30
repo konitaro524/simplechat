@@ -2,139 +2,133 @@
 import json
 import os
 import boto3
-import re  # 正規表現モジュールをインポート
+import re
 from botocore.exceptions import ClientError
 
 
-# Lambda コンテキストからリージョンを抽出する関数
-def extract_region_from_arn(arn):
-    # ARN 形式: arn:aws:lambda:region:account-id:function:function-name
-    match = re.search('arn:aws:lambda:([^:]+):', arn)
-    if match:
-        return match.group(1)
-    return "us-east-1"  # デフォルト値
+# ──────────────────────────────────────────────────────────────────────────────
+#  ユーティリティ
+# ──────────────────────────────────────────────────────────────────────────────
+def extract_region_from_arn(arn: str) -> str:
+    """Lambda ARN からリージョン名を取り出す"""
+    match = re.search(r'arn:aws:lambda:([^:]+):', arn)
+    return match.group(1) if match else "us-east-1"
 
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
 
-# モデルID
-MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+# ──────────────────────────────────────────────────────────────────────────────
+#  環境変数／グローバル
+# ──────────────────────────────────────────────────────────────────────────────
+MODEL_ID   = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+# 例: "us.amazon.nova-lite-v1:0" → "nova-lite-v1"
+MODEL_NAME = MODEL_ID.split(":")[0].split(".")[-1]
 
+bedrock_client = None   # 再利用用のシングルトン
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Lambda ハンドラ
+# ──────────────────────────────────────────────────────────────────────────────
 def lambda_handler(event, context):
+    global bedrock_client
+
     try:
-        # コンテキストから実行リージョンを取得し、クライアントを初期化
-        global bedrock_client
+        # 1) Bedrock クライアント初期化
         if bedrock_client is None:
             region = extract_region_from_arn(context.invoked_function_arn)
-            bedrock_client = boto3.client('bedrock-runtime', region_name=region)
-            print(f"Initialized Bedrock client in region: {region}")
-        
-        print("Received event:", json.dumps(event))
-        
-        # Cognitoで認証されたユーザー情報を取得
-        user_info = None
-        if 'requestContext' in event and 'authorizer' in event['requestContext']:
-            user_info = event['requestContext']['authorizer']['claims']
-            print(f"Authenticated user: {user_info.get('email') or user_info.get('cognito:username')}")
-        
-        # リクエストボディの解析
-        body = json.loads(event['body'])
-        message = body['message']
-        conversation_history = body.get('conversationHistory', [])
-        
-        print("Processing message:", message)
-        print("Using model:", MODEL_ID)
-        
-        # 会話履歴を使用
-        messages = conversation_history.copy()
-        
-        # ユーザーメッセージを追加
-        messages.append({
-            "role": "user",
-            "content": message
-        })
-        
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
-        
-        # invoke_model用のリクエストペイロード
-        request_payload = {
-            "messages": bedrock_messages,
+            bedrock_client = boto3.client("bedrock-runtime", region_name=region)
+            print(f"[Init] Bedrock client initialized in region: {region}")
+
+        print(f"[Event] {json.dumps(event)[:400]}...")  # 長すぎる場合は一部のみ出力
+
+        # 2) Cognito ユーザーを取得（任意）
+        user_info = (
+            event.get("requestContext", {})
+                 .get("authorizer", {})
+                 .get("claims", {})
+        )
+        if user_info:
+            print(f"[Auth] user={user_info.get('email') or user_info.get('cognito:username')}")
+
+        # 3) リクエストボディ解析
+        body                = json.loads(event["body"])
+        user_message        = body["message"]
+        conversation_history = body.get("conversationHistory", [])
+
+        print(f"[Input] msg='{user_message}' | model_id='{MODEL_ID}'")
+
+        # 4) 会話履歴構築（最初にモデル名の SYSTEM メッセージを追加）
+        messages = [{
+            "role":    "system",
+            "content": f"You are chatting with model **{MODEL_NAME}**."
+        }] + conversation_history
+
+        messages.append({"role": "user", "content": user_message})
+
+        # Bedrock 形式に変換
+        bedrock_messages = [
+            {
+                "role"   : m["role"],
+                "content": [{"text": m["content"]}]
+            } for m in messages
+        ]
+
+        # 5) Bedrock 推論呼び出し
+        payload = {
+            "messages"       : bedrock_messages,
             "inferenceConfig": {
-                "maxTokens": 512,
+                "maxTokens"   : 512,
                 "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
+                "temperature" : 0.7,
+                "topP"        : 0.9
             }
         }
-        
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
-        
-        # invoke_model APIを呼び出し
+
+        print(f"[Invoke] payload={json.dumps(payload)[:400]}...")
+
         response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
+            modelId    = MODEL_ID,
+            body       = json.dumps(payload),
+            contentType= "application/json"
         )
-        
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
-        
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
-            raise Exception("No response content from the model")
-        
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
-        
-        # アシスタントの応答を会話履歴に追加
-        messages.append({
-            "role": "assistant",
-            "content": assistant_response
-        })
-        
-        # 成功レスポンスの返却
+
+        res_body = json.loads(response["body"].read())
+        print(f"[Bedrock] raw_response={json.dumps(res_body)[:400]}...")
+
+        assistant_response = (
+            res_body["output"]["message"]["content"][0]["text"]
+        )
+
+        messages.append({"role": "assistant", "content": assistant_response})
+
+        # 6) 成功レスポンス
         return {
             "statusCode": 200,
             "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
-                "Access-Control-Allow-Methods": "OPTIONS,POST"
+                "Content-Type"                 : "application/json",
+                "Access-Control-Allow-Origin"  : "*",
+                "Access-Control-Allow-Headers" : "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                "Access-Control-Allow-Methods" : "OPTIONS,POST"
             },
             "body": json.dumps({
-                "success": True,
-                "response": assistant_response,
+                "success"          : True,
+                "modelId"          : MODEL_ID,      # ←★ クライアントにモデルIDを返却
+                "response"         : assistant_response,
                 "conversationHistory": messages
             })
         }
-        
-    except Exception as error:
-        print("Error:", str(error))
-        
+
+    except Exception as e:
+        print(f"[Error] {e}")
         return {
             "statusCode": 500,
             "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
-                "Access-Control-Allow-Methods": "OPTIONS,POST"
+                "Content-Type"                 : "application/json",
+                "Access-Control-Allow-Origin"  : "*",
+                "Access-Control-Allow-Headers" : "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                "Access-Control-Allow-Methods" : "OPTIONS,POST"
             },
             "body": json.dumps({
                 "success": False,
-                "error": str(error)
+                "error"  : str(e)
             })
         }
